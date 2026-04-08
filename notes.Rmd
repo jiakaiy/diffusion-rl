@@ -1,0 +1,165 @@
+ere's the full content to copy and paste:
+
+---
+title: "d1: Scaling Reasoning in Diffusion LLMs via Reinforcement Learning"
+subtitle: "Paper Reading Notes — Log-Probability Estimation & diffu-GRPO"
+author: ""
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    highlight: tango
+---
+
+---
+
+## Setup
+
+We walk through the core mechanism of **d1** using a concrete example.
+
+| Symbol | Value |
+|--------|-------|
+| Prompt $q$ | `"Xiao Ming has 3 apples, ate 1, how many are left?"` |
+| Generated completion $o$ | `"2 are left"` — tokenized as 3 tokens: `[still]`, `[2]`, `[left]` |
+| Goal | Estimate $\log p(\text{"2"} \mid q)$, the model's probability for token `"2"` at position 2 |
+
+---
+
+## Step-by-Step: One-Step Log-Probability Estimation
+
+### Step 1 — Randomly mask part of the prompt
+
+Apply random masking to the prompt with probability $p_{\text{mask}} = 0.15$, producing $q'$:
+Original q:  [Xiao Ming] [has]  [3] [apples] [,] [ate] [1] [,] [how many] [left] [?]
+Masked   q': [Xiao Ming]  [M]   [3] [apples] [,] [ate] [M] [,] [how many] [left] [?]
+
+Most tokens survive; a small fraction are replaced by `[M]`.
+
+---
+
+### Step 2 — Set the entire completion side to MASK
+
+We do **not** feed the already-generated completion $o$ back in.
+Instead, every completion position becomes `[M]`:
+Input to model:
+[ Xiao Ming  [M]  3  apples  ,  ate  [M]  ,  how many  left  ? ]  [ [M]   [M]   [M] ]
+<--------------------- q' (partially masked prompt) ------------>  <--- full MASK --->
+pos1  pos2  pos3
+
+---
+
+### Step 3 — Single forward pass
+
+The model outputs a probability distribution at every `[M]` position in one shot:
+Model output (completion positions only):
+pos1:  p("still") = 0.82,  p("answer") = 0.05,  p("total") = 0.03, ...
+pos2:  p("2")     = 0.91,  p("1")      = 0.04,  p("3")     = 0.03, ...  <- target
+pos3:  p("left")  = 0.88,  p("only")   = 0.06, ...
+
+---
+
+### Step 4 — Extract the token probability from $o$
+
+Look up the probability of the actually-generated token at each completion position:
+
+$$\log \hat{p}(o_2 = \text{"2"} \mid q) \approx \log(0.91) = -0.094$$
+
+---
+
+## Full Two-Stage Estimation Diagram
+
+### Stage 1 — Outer loop (done once per prompt)
++---------------------------------------------------------+
+|  Input:   [ prompt q ] + [ MASK  MASK  ...  MASK ]     |
+|  Process: Full diffusion denoising (128 steps)         |
+|  Output:  completion o = "2 are left"                  |
++---------------------------------------------------------+
+
+### Stage 2 — Inner loop (once per mu gradient update, different masking pattern each time)
++---------------------------------------------------------------------+
+|  Input:                                                             |
+|  [ Xiao Ming [M] 3 apples ate [M] ? ]  +  [ [M]   [M]   [M]  ]    |
+|  <---------- q' (randomly masked prompt) --------->  <- full MASK->|
+|                                                      pos1 pos2 pos3 |
+|                                                                     |
+|  One forward pass                                                   |
+|         |                                                           |
+|         v                                                           |
+|  Model outputs probability distributions at all [M] positions      |
+|         |                                                           |
+|         v                                                           |
+|  Extract completion-position probabilities:                         |
+|    pos1:  p("still") = 0.81  ->  log(0.81) = -0.210                |
+|    pos2:  p("2")     = 0.91  ->  log(0.91) = -0.094                |
+|    pos3:  p("left")  = 0.88  ->  log(0.88) = -0.128                |
+|         |                                                           |
+|         v                                                           |
+|  log p_hat(o|q) = -0.210 + (-0.094) + (-0.128) = -0.432            |
++---------------------------------------------------------------------+
+
+---
+
+## diffu-GRPO: Full Training Loop
+
+### Outer loop (requires online generation — expensive)
++-------------------------------------------------------------------+
+|  1. Sample prompt q from dataset D                                |
+|                                                                   |
+|  2. Run full diffusion with old policy, generate G = 8            |
+|     completions:                                                  |
+|       o1 = "answer is 2",  o2 = "answer is 5", ..., o8 = "1"     |
+|                                                                   |
+|  3. Compute reward for each completion:                           |
+|       r1 = 2.5,  r2 = 0.5,  ...,  r8 = 0.5                       |
+|                                                                   |
+|  4. Compute group-normalized advantage:                           |
+|       A1 = +1.0,  A2 = -1.0,  ...                                 |
+|                                                                   |
+|  +-- Inner loop  mu = 12  (forward passes only -- cheap) ------+  |
+|  |  Iteration n:                                               |  |
+|  |  a. Randomly mask q -> q'_n  (new pattern each iteration)  |  |
+|  |  b. One forward pass for theta, theta_old, theta_ref:       |  |
+|  |       Input: [ q'_n  +  ALL-MASK completion ]               |  |
+|  |       Extract per-token log-probs for o1, ..., o8           |  |
+|  |  c. Compute objective:                                      |  |
+|  |       ratio = p_theta(token) / p_theta_old(token)           |  |
+|  |       loss  = clipped(ratio) x advantage  -  beta * KL      |  |
+|  |  d. Gradient descent -> update theta                        |  |
+|  +-------------------------------------------------------------+  |
+|                                                                   |
+|  5. After inner loop:  theta_old <- theta -> next outer step      |
++-------------------------------------------------------------------+
+
+---
+
+## Key Insight: Why Random Prompt Masking Helps
+
+Each inner-loop iteration sees a **different masked view** $q'_n$ of the same prompt.
+This acts as **implicit data augmentation** and **regularization**, preventing
+the policy from overfitting within a single batch.
+
+This allows scaling $\mu$ from the typical value of 2 up to **12 or even 24**,
+so the model extracts more learning signal per expensive online generation —
+dramatically reducing wall-clock training time.
+
+---
+
+## Summary of Notation
+
+| Symbol | Meaning |
+|--------|---------|
+| $q$ | Original prompt |
+| $q'$ | Randomly masked version of $q$ |
+| $o$ | Completion generated by the old policy |
+| $p_{\text{mask}}$ | Probability of masking each prompt token (default 0.15) |
+| $\mu$ | Number of inner gradient updates per outer batch |
+| $G$ | Number of completions sampled per prompt (default 8) |
+| $A_i^k$ | Advantage for token $k$ of completion $i$ |
+| $\hat{p}(o \mid q)$ | Mean-field approximation of sequence log-probability |
+
+---
+
+*Notes based on: Zhao et al. (2025), "d1: Scaling Reasoning in Diffusion Large Language
+Models via Reinforcement Learning." arXiv:2504.12216.*
