@@ -19,8 +19,8 @@ class DiffuGRPOTrainer(GRPOTrainer):
 
 `DiffuGRPOTrainer` directly inherits TRL's `GRPOTrainer`. The only overridden methods are:
 
-| `_get_per_token_logps()` | **NEW** (~50 lines) | Core estimator , main contribution |
-| `forward_process()` | **NEW** | Random prompt masking for diffusion |
+| `_get_per_token_logps()` | Core estimator , main contribution |
+| `forward_process()` | Random prompt masking for diffusion |
 | `generate()` | **REPLACED** | LLaDA-style iterative denoising |
 | `compute_loss()` | **PATCHED** | Plug new log-probs into GRPO loss |
 | `_generate_and_score_completions()` | **PATCHED** | Connect diffusion generation to RL loop |
