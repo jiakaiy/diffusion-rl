@@ -17,7 +17,7 @@ output:
 
 ## Setup
 
-We walk through the core mechanism of **d1** using a concrete example.
+Example: 
 
 | Symbol | Value |
 |--------|-------|
