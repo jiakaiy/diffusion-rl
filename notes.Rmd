@@ -13,91 +13,118 @@ output:
     highlight: tango
 ---
 
----
-
-## Setup
-
-Example: 
-
-| Symbol | Value |
-|--------|-------|
-| Prompt $q$ | `"Xiao Ming has 3 apples, ate 1, how many are left?"` |
-| Generated completion $o$ | `"2 are left"` — tokenized as 3 tokens: `[still]`, `[2]`, `[left]` |
-| Goal | Estimate $\log p(\text{"2"} \mid q)$, the model's probability for token `"2"` at position 2 |
+# dLLM GRPO Training: Rollout & Optimization Explained
 
 ---
 
-## Step-by-Step: One-Step Log-Probability Estimation
-
-### Step 1 — Randomly mask part of the prompt
-
-Apply random masking to the prompt with probability $p_{\text{mask}} = 0.15$, producing $q'$:
-Original q:  [Xiao Ming] [has]  [3] [apples] [,] [ate] [1] [,] [how many] [left] [?]
-Masked   q': [Xiao Ming]  [M]   [3] [apples] [,] [ate] [M] [,] [how many] [left] [?]
-
-Most tokens survive; a small fraction are replaced by `[M]`.
+## ROLLOUT Phase
+*(Generate real answers — expensive, done once per round)*
 
 ---
 
-### Step 2 — Set the entire completion side to MASK
+**Input:** `[ prompt: "Xiao Ming has 3 apples..." ]` + `[ MASK MASK MASK MASK MASK ]`
 
-We do **not** feed the already-generated completion $o$ back in.
-Instead, every completion position becomes `[M]`:
-Input to model:
-[ Xiao Ming  [M]  3  apples  ,  ate  [M]  ,  how many  left  ? ]  [ [M]   [M]   [M] ]
-<--------------------- q' (partially masked prompt) ------------>  <--- full MASK --->
-pos1  pos2  pos3
+```
+                                                      ↑ answer region, all masked
+```
+
+Using **block-wise semi-autoregressive decoding** to progressively unmask:
+
+| Step | Token Sequence |
+|------|----------------|
+| Step 1 | `[ prompt ]` + `[ MASK MASK MASK MASK MASK ]` |
+| Step 2 | `[ prompt ]` + `[ "has" MASK MASK MASK MASK ]` ← block 1 starts unmasking |
+| Step 3 | `[ prompt ]` + `[ "has" "left" MASK MASK MASK ]` |
+| Step 4 | `[ prompt ]` + `[ "has" "left" "2" MASK MASK ]` |
+| Step 5 | `[ prompt ]` + `[ "has" "left" "2" "apples" MASK ]` |
+| Step 6 | `[ prompt ]` + `[ "has" "left" "2" "apples" "remaining" ]` ← generation complete |
+
+Generate **G = 8** different answers, each going through the full denoising process above.
+
+**Compute the reward for each answer:**
+
+| Answer | Output | Reward | Advantage |
+|--------|--------|--------|-----------|
+| o₁ | "2 apples remaining" | r₁ = 2.5 | A₁ = **+1.0** (good answer) |
+| o₂ | "5 apples remaining" | r₂ = 0.5 | A₂ = **−1.0** (bad answer) |
+| ... | ... | ... | ... |
 
 ---
 
-### Step 3 — Single forward pass
-
-The model outputs a probability distribution at every `[M]` position in one shot:
-Model output (completion positions only):
-pos1:  p("still") = 0.82,  p("answer") = 0.05,  p("total") = 0.03, ...
-pos2:  p("2")     = 0.91,  p("1")      = 0.04,  p("3")     = 0.03, ...  <- target
-pos3:  p("left")  = 0.88,  p("only")   = 0.06, ...
+## OPTIMIZATION Phase
+*(Compute loss and update parameters — cheap, repeated µ times)*
 
 ---
 
-### Step 4 — Extract the token probability from $o$
+**Goal:** Compute `log π_θ(o | q)` — i.e., *"the probability the model assigns to generating this answer"*
 
-Look up the probability of the actually-generated token at each completion position:
-
-$$\log \hat{p}(o_2 = \text{"2"} \mid q) \approx \log(0.91) = -0.094$$
+**Problem:** This probability cannot be computed directly! *(This is the fundamental difficulty of dLLMs.)*
 
 ---
 
-## Full Two-Stage Estimation Diagram
+### d1's Solution: One-Step ELBO Estimation
 
-### Stage 1 — Outer loop (done once per prompt)
-+---------------------------------------------------------+
-|  Input:   [ prompt q ] + [ MASK  MASK  ...  MASK ]     |
-|  Process: Full diffusion denoising (128 steps)         |
-|  Output:  completion o = "2 are left"                  |
-+---------------------------------------------------------+
+1. Randomly mask part of the prompt → `q'`
+2. Mask the entire answer region
+3. Run one forward pass
+4. Read the token probability at each answer position directly
+5. Sum them up as an estimate of `log π_θ(o | q)`
 
-### Stage 2 — Inner loop (once per mu gradient update, different masking pattern each time)
-+---------------------------------------------------------------------+
-|  Input:                                                             |
-|  [ Xiao Ming [M] 3 apples ate [M] ? ]  +  [ [M]   [M]   [M]  ]    |
-|  <---------- q' (randomly masked prompt) --------->  <- full MASK->|
-|                                                      pos1 pos2 pos3 |
-|                                                                     |
-|  One forward pass                                                   |
-|         |                                                           |
-|         v                                                           |
-|  Model outputs probability distributions at all [M] positions      |
-|         |                                                           |
-|         v                                                           |
-|  Extract completion-position probabilities:                         |
-|    pos1:  p("still") = 0.81  ->  log(0.81) = -0.210                |
-|    pos2:  p("2")     = 0.91  ->  log(0.91) = -0.094                |
-|    pos3:  p("left")  = 0.88  ->  log(0.88) = -0.128                |
-|         |                                                           |
-|         v                                                           |
-|  log p_hat(o|q) = -0.210 + (-0.094) + (-0.128) = -0.432            |
-+---------------------------------------------------------------------+
+**Input:**
+```
+[ Xiao[M] 3 apples[M][M] ] + [ MASK MASK MASK MASK MASK ]
+          ↑ random prompt masking
+```
+
+**Output:**
+```
+pos 1:  p("has")       = 0.81  →  log(0.81) = −0.21
+pos 2:  p("left")      = 0.91  →  log(0.91) = −0.09
+pos 3:  p("2")         = 0.88  →  log(0.88) = −0.13
+...
+log π̂(o|q) = −0.21 + (−0.09) + (−0.13) + ... = −0.43
+```
+
+> ← This **−0.43** is a single-sample estimate of the ELBO!
+> ← It is a **lower bound** on the true `log π_θ(o | q)`
+
+Each iteration uses a fresh random mask pattern → acts as a **regularizer**.
+Repeat **µ = 12** times.
+
+---
+
+### Loss Computation (GRPO Objective)
+
+```
+ratio  = π_θ(o | q') / π_θ_old(o | q')
+loss   = clipped(ratio) × advantage  −  β × KL
+```
+
+**Update parameters θ.**
+
+---
+
+## Where ELBO Appears — Summary
+
+d1's one-step estimation is fundamentally an estimate of the **ELBO**.
+
+The rigorous ELBO definition is:
+
+```
+L_ELBO = E_{t, z_t} [ Σ_i  w(t) · 1(z_{t,i} = mask) · log π_θ(x_i | z_t) ]
+```
+
+d1 takes an extreme simplification: **t = 1** (answer fully masked), doing only a single forward pass.
+This is a coarse approximation of the ELBO — correct in direction (it is a lower bound), but the estimate is rough.
+
+**UniGRPO** performs a full Monte Carlo estimate, much closer to the true ELBO, but more expensive.
+
+---
+
+
+
+
+
 
 ---
 
