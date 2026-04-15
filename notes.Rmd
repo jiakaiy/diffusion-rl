@@ -92,84 +92,108 @@ Each iteration uses a fresh random mask pattern → acts as a **regularizer**.
 Repeat **µ = 12** times.
 
 ---
-
-### Loss Computation (GRPO Objective)
-
-```
-ratio  = π_θ(o | q') / π_θ_old(o | q')
-loss   = clipped(ratio) × advantage  −  β × KL
-```
-
-**Update parameters θ.**
+# SPG Training: Rollout & Optimization Explained
 
 ---
 
-## Where ELBO Appears — Summary
-
-d1's one-step estimation is fundamentally an estimate of the **ELBO**.
-
-The rigorous ELBO definition is:
-
-```
-L_ELBO = E_{t, z_t} [ Σ_i  w(t) · 1(z_{t,i} = mask) · log π_θ(x_i | z_t) ]
-```
-
-d1 takes an extreme simplification: **t = 1** (answer fully masked), doing only a single forward pass.
-This is a coarse approximation of the ELBO — correct in direction (it is a lower bound), but the estimate is rough.
-
-**UniGRPO** performs a full Monte Carlo estimate, much closer to the true ELBO, but more expensive.
-
----
-
-
-
-
+## ROLLOUT Phase
 
 
 ---
 
-## diffu-GRPO: Full Training Loop
+**Input:** `[ prompt: "Xiao Ming has 3 apples, ate 1, how many left?" ]` + `[ MASK MASK MASK MASK MASK ]`
 
-### Outer loop (requires online generation — expensive)
-+-------------------------------------------------------------------+
-|  1. Sample prompt q from dataset D                                |
-|                                                                   |
-|  2. Run full diffusion with old policy, generate G = 8            |
-|     completions:                                                  |
-|       o1 = "answer is 2",  o2 = "answer is 5", ..., o8 = "1"     |
-|                                                                   |
-|  3. Compute reward for each completion:                           |
-|       r1 = 2.5,  r2 = 0.5,  ...,  r8 = 0.5                       |
-|                                                                   |
-|  4. Compute group-normalized advantage:                           |
-|       A1 = +1.0,  A2 = -1.0,  ...                                 |
-|                                                                   |
-|  +-- Inner loop  mu = 12  (forward passes only -- cheap) ------+  |
-|  |  Iteration n:                                               |  |
-|  |  a. Randomly mask q -> q'_n  (new pattern each iteration)  |  |
-|  |  b. One forward pass for theta, theta_old, theta_ref:       |  |
-|  |       Input: [ q'_n  +  ALL-MASK completion ]               |  |
-|  |       Extract per-token log-probs for o1, ..., o8           |  |
-|  |  c. Compute objective:                                      |  |
-|  |       ratio = p_theta(token) / p_theta_old(token)           |  |
-|  |       loss  = clipped(ratio) x advantage  -  beta * KL      |  |
-|  |  d. Gradient descent -> update theta                        |  |
-|  +-------------------------------------------------------------+  |
-|                                                                   |
-|  5. After inner loop:  theta_old <- theta -> next outer step      |
-+-------------------------------------------------------------------+
+```
+                                                       ↑ answer region, all masked
+```
+
+Assume **block size = 3**, so the answer region is divided as:
+
+```
+Block 1: positions 1–3    [ MASK  MASK  MASK ]
+Block 2: positions 4–5    [ MASK  MASK ]
+```
+
+### Decoding strategy: block-wise semi-autoregressive, confidence-based
+
+SPG uses the **same rollout strategy as d1**: proceed block by block left to right,  
+but **within each block**, each diffusion step only unmasks the **2 highest-confidence tokens** 
+ 
 
 ---
 
-## Key Insight: Why Random Prompt Masking Helps
+Generate **G = 8** different answers, each going through the full denoising process .
 
-Each inner-loop iteration sees a **different masked view** $q'_n$ of the same prompt.
-This acts as **implicit data augmentation** and **regularization**, preventing
-the policy from overfitting within a single batch.
+**Compute the reward and advantage for each answer:**
 
-This allows scaling $\mu$ from the typical value of 2 up to **12 or even 24**,
-so the model extracts more learning signal per expensive online generation —
-dramatically reducing wall-clock training time.
+| Answer | Output | Reward | Advantage Aʲ |
+|--------|--------|--------|--------------|
+| x¹ | "还剩2个苹果" | r¹ = 2.5 | A¹ = **+1.0** (good answer) |
+| x² | "还剩5个苹果" | r² = 0.5 | A² = **−1.0** (bad answer) |
+| ... | ... | ... | ... |
+
+$$A^j = R(c, x^j) - \frac{1}{g}\sum_{\ell=1}^{g} R(c, x^\ell)$$
+
+---
+
+## OPTIMIZATION Phase
+*(Compute loss and update parameters — cheap, repeated µ times)*
+
+
+---
+
+### SPG's Solution: Block-wise Monte Carlo Estimation
+
+Unlike d1 which randomly masks the **prompt**, SPG randomly masks **one block of the answer** at a time.  
+This is called **block-wise masking**.
+
+**The full answer is:** `["还" "剩" "2" "个" "苹果"]`  
+**Blocks:** `Block 1 = ["还" "剩" "2"]`, `Block 2 = ["个" "苹果"]`
+
+
+```
+Rule:
+  blocks BEFORE the chosen block  → keep CLEAN
+  the chosen block itself          → randomly mask SOME tokens inside
+  blocks AFTER the chosen block   → mask ALL tokens
+  prompt + clean blocks           → lightly perturb with p_mask = 0.15
+```
+
+---
+
+
+**MC Sample 1 — Block 2 is chosen:**
+
+```
+[ prompt ] + [ "还"  "剩"  "2" | MASK  "苹果" ]
+                ↑ Block 1 clean  ↑ Block 2: "个" randomly masked
+```
+
+Model reads: `p("个" | "还","剩","2", MASK,"苹果")` → contributes to ELBO/EUBO estimate
+
+---
+
+**MC Sample 2 — Block 2 is chosen again (random, can repeat):**
+
+```
+[ prompt ] + [ "还"  "剩"  "2" | MASK  MASK ]
+                ↑ Block 1 clean  ↑ Block 2: both tokens masked
+```
+
+Model reads: `p("个"|...)` and `p("苹果"|...)` → contributes another estimate
+
+---
+
+**MC Sample 3 — Block 1 is chosen:**
+
+```
+[ prompt ] + [ "还"  MASK  MASK | MASK  MASK ]
+                ↑ Block 1: "剩","2" masked   ↑ Block 2: all masked (after chosen block)
+```
+
+Model reads: `p("剩"|...)` and `p("2"|...)` → contributes another estimate
+
+
 
 ---
 
