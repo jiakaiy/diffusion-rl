@@ -12,15 +12,11 @@ Before anything else, nail this down:
 | **Optimization unit** | Whole sequence at once | Whole sequence at once | **Each step of the trajectory** |
 | **Token probability condition** | Random masked prompt | Block-wise masked answer | **Previously decoded tokens (real prefix)** |
 
-> **The core problem TraceRL identifies:**  
-> d1 and SPG compute token probabilities conditioned on a *randomly masked* input.  
-> But during inference, `"剩"` is decoded conditioned on `"还"` already being decoded.  
-> These two distributions are completely different — training and inference are misaligned.  
-> TraceRL fixes this by training directly on the real inference trajectory.
+
 
 ---
 
-## ROLLOUT Phase
+## ROLLOUT Phase(same as SPG and d1)
 *(Generate real answers and record every step — expensive, done once per round)*
 
 ---
@@ -29,11 +25,7 @@ Before anything else, nail this down:
 
 **Answer region (initial):** `[ MASK MASK MASK MASK MASK ]`
 
-Assume **block size B = 3**, so the answer splits into:
-```
-Block 1: positions 1–3   [ MASK  MASK  MASK ]
-Block 2: positions 4–5   [ MASK  MASK ]
-```
+
 
 ### Decoding: block-wise dynamic sampling (unmask highest-confidence tokens each step)
 
@@ -103,92 +95,6 @@ $$|\tau^s_i| = \lceil |\tau_i| / s \rceil \quad \text{→ forward passes reduced
 
 ---
 
-## OPTIMIZATION Phase — Without Value Model
-*(Use trajectory slices as training samples, repeated K times)*
-
----
-
-### How token probabilities are computed — the core difference
-
-**d1 computes:**
-```
-π_θ("还" | random_masked_prompt)    ← all tokens independent, same masked context
-π_θ("剩" | random_masked_prompt)    ← "还" being decoded is ignored
-π_θ("2"  | random_masked_prompt)
-```
-
-**TraceRL computes (using real decoded prefix from τˢ):**
-```
-π_θ("还","剩","2" | [])                    ← τˢ(1): conditioned on empty prefix
-π_θ("个","苹果"   | "还","剩","2")         ← τˢ(2): conditioned on previously decoded tokens
-```
-
-Each step's tokens are conditioned on **everything decoded before it** — exactly what happens during inference.
-
----
-
-### What the training samples look like
-
-Trajectory after shrinkage: `τˢ = ({"还","剩","2"}, {"个","苹果"})`
-
-**Training sample for τˢ(1) — learn the first step:**
-```
-Input:   [prompt] + [MASK  MASK  MASK  MASK  MASK]
-                     ↑ full answer region masked (empty prefix)
-Target:  "还", "剩", "2"
-```
-*"Given prompt and nothing decoded yet, what should be decoded first?"*
-
-**Training sample for τˢ(2) — learn the second step:**
-```
-Input:   [prompt] + ["还"  "剩"  "2"  MASK  MASK]
-                     ↑ previous step's tokens are visible as prefix
-Target:  "个", "苹果"
-```
-*"Given that '还剩2' has already been decoded, what comes next?"*
-
-> **This is trajectory-aware RL.**  
-> TraceRL is NOT asking: "what is log π(whole answer)?"  
-> TraceRL IS asking: "given the real prefix from rollout, how likely is each next step?"
-
----
-
-### Policy Objective (Equation 3 from paper)
-
-$$\mathcal{J}_{\text{policy}}(\theta_p) = \mathbb{E}\!\left[\sum_{i=1}^{G}\sum_{t=1}^{|\tau^s_i|}\sum_{o_k \in \tau^s_i(t)} C_\epsilon\!\left(\frac{\pi_{\theta_p}(o_k \mid \tau^s_i(1{:}t{-}1))}{\pi_{\text{old}}(o_k \mid \tau^s_i(1{:}t{-}1))},\ A_i\right)\!\bigg/|\tau^s_i(t)|\right] - \beta\,\mathbb{KL}[\pi_\theta \| \pi_{\text{old}}]$$
-
-**With concrete numbers (τ¹, A¹ = +0.8, ε = 0.2):**
-
-**Step t=1, tokens {"还","剩","2"}, prefix = empty:**
-```
-π_θ("还" | [])  = 0.81,  π_old = 0.79  →  ratio = 1.025
-π_θ("剩" | [])  = 0.79,  π_old = 0.77  →  ratio = 1.026
-π_θ("2"  | [])  = 0.88,  π_old = 0.85  →  ratio = 1.035
-
-C_ε(1.025, +0.8) = min(1.025×0.8, clip(1.025,0.8,1.2)×0.8) = min(0.820, 0.820) = 0.820
-Average over 3 tokens → 0.827
-```
-
-**Step t=2, tokens {"个","苹果"}, prefix = {"还","剩","2"}:**
-```
-π_θ("个"  | "还","剩","2") = 0.92,  π_old = 0.90  →  ratio = 1.022
-π_θ("苹果"| "还","剩","2") = 0.95,  π_old = 0.93  →  ratio = 1.022
-
-C_ε(1.022, +0.8) = 0.818
-Average over 2 tokens → 0.818
-```
-
-**Final loss:**
-```
-loss = −(0.827 + 0.818) / 2  −  β × KL
-     = −0.823  −  β × KL
-
-→ gradient step pushes model to assign higher probability to good trajectory steps
-```
-
-> **Without value model:** the same Aᵢ = +0.8 is used for ALL steps of this trajectory.  
-> Every slice — τˢ(1) and τˢ(2) — gets the same advantage score.  
-> This is simple but coarse: early tokens get the same credit as the final token.
 
 ---
 
@@ -307,17 +213,7 @@ A_苹果 = (1 − 1.5) + 0    + 1×0       = −0.50  ← slightly negative (ove
 > `"苹果"` gets −0.50 because the value model overestimated it.  
 > This is far more informative than the flat A = +0.8 from the no-value-model case.
 
----
 
-### Value model training objective (Equation 4 from paper)
-
-The value model $V_{\theta_v}$ is updated alongside the policy:
-
-$$\mathcal{J}_{\text{value}}(\theta_v) = \frac{1}{2}\mathbb{E}_\tau\!\left[\frac{1}{|\tau|}\sum_{j\in\tau}\max\!\left((V_{\theta_v}(\tau)_j - R_j)^2,\ (V_j^{\text{clip}} - R_j)^2\right)\right]$$
-
-where $V_j^{\text{clip}} = V_j^{\text{old}} + \text{clip}(V_{\theta_v}(\tau)_j - V_j^{\text{old}},\ {-\epsilon},\ \epsilon)$.
-
-This is the same clipped regression loss style as PPO's value update.
 
 ---
 
