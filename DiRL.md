@@ -35,20 +35,20 @@ This is the heart of it. From Figure 4 in the DiRL paper:
 Let's build intuition with a concrete example.
 
 **Setup:**
-- Answer: `["has"] ["left"] ["2"] ["apples"] ["remaining"]`
+- Answer: `["still"] ["has"] ["2"] ["apples"] ["left"]`  ← "still has 2 apples left"
 - Block size B = 2
-- Block 1 = `["has", "left"]`, Block 2 = `["2", "apples"]`, Block 3 = `["remaining"]`
+- Block 1 = `["still", "has"]`, Block 2 = `["2", "apples"]`, Block 3 = `["left"]`
 
 **Rollout phase (identical for both):**
 
 ```
-Step 1: Inside Block 1, highest confidence → decode "has"        τ(1) = {"has"}
-Step 2: Inside Block 1, decode remaining  → decode "left"       τ(2) = {"left"}   ← Block 1 done
-Step 3: Inside Block 2, decode together   → decode "2","apples" τ(3) = {"2","apples"} ← Block 2 done
-Step 4: Inside Block 3, decode            → decode "remaining"  τ(4) = {"remaining"}
+Step 1: Inside Block 1, highest confidence → decode "still"        τ(1) = {"still"}
+Step 2: Inside Block 1, decode remaining  → decode "has"           τ(2) = {"has"}    ← Block 1 done
+Step 3: Inside Block 2, decode together   → decode "2","apples"    τ(3) = {"2","apples"} ← Block 2 done
+Step 4: Inside Block 3, decode            → decode "left"          τ(4) = {"left"}
 ```
 
-Full trajectory: $\tau = (\{"has"\},\ \{"left"\},\ \{"2","apples"\},\ \{"remaining"\})$
+Full trajectory: $\tau = (\{"still"\},\ \{"has"\},\ \{"2","apples"\},\ \{"left"\})$
 
 ---
 
@@ -56,27 +56,27 @@ Full trajectory: $\tau = (\{"has"\},\ \{"left"\},\ \{"2","apples"\},\ \{"remaini
 
 ### TraceRL's approach (with shrinkage s=2)
 
-First compress: $\tau^s = (\{"has","left"\},\ \{"2","apples","remaining"\})$
+First compress: $\tau^s = (\{"still","has"\},\ \{"2","apples","left"\})$
 
-**Computing probability for τˢ(1) = {"has","left"}, prefix = empty:**
+**Computing probability for τˢ(1) = {"still","has"}, prefix = empty:**
 
 ```
 Both tokens conditioned on empty prefix, computed together:
 
-π_θ("has"  | []) = 0.81
-π_θ("left" | []) = 0.91   ← ⚠️ Approximation here!
-                              "left" was actually decoded AFTER "has" in rollout
+π_θ("still" | []) = 0.81
+π_θ("has"   | []) = 0.91   ← ⚠️ Approximation here!
+                              "has" was actually decoded AFTER "still" in rollout
                               but shrinkage merges the two steps,
                               treating them as if decoded simultaneously
                               → the conditional structure doesn't fully match rollout
 ```
 
-**Computing probability for τˢ(2) = {"2","apples","remaining"}, prefix = {"has","left"}:**
+**Computing probability for τˢ(2) = {"2","apples","left"}, prefix = {"still","has"}:**
 
 ```
-π_θ("2"         | "has","left") = 0.88
-π_θ("apples"    | "has","left") = 0.92
-π_θ("remaining" | "has","left") = 0.95
+π_θ("2"      | "still","has") = 0.88
+π_θ("apples" | "still","has") = 0.92
+π_θ("left"   | "still","has") = 0.95
 ```
 
 **Attention implementation:** Complex irregular mask → FlashAttention can't handle it → vanilla attention → **slow**
@@ -85,46 +85,46 @@ Both tokens conditioned on empty prefix, computed together:
 
 ### DiRL's approach (no shrinkage, FlexAttention)
 
-DiRL doesn't need shrinkage because FlexAttention can handle fine-grained masks efficiently. So it computes each step separately with a fully exact conditional structure:
+DiRL doesn't need shrinkage because FlexAttention can handle fine-grained masks efficiently:
 
-**Step 1: token "has", prefix = empty**
+**Step 1: token "still", prefix = empty**
 
 ```
 Model input: [prompt] + [MASK MASK | MASK MASK | MASK]
                          ↑ Block 1 fully masked (predicting step 1)
 
-π_θ("has" | prompt, []) = 0.81   ← Exact! No random masking anywhere
+π_θ("still" | prompt, []) = 0.81   ← Exact! No random masking anywhere
 ```
 
-**Step 2: token "left", prefix = {"has"}**
+**Step 2: token "has", prefix = {"still"}**
 
 ```
-Model input: [prompt] + ["has" MASK | MASK MASK | MASK]
-                         ↑ "has" is known, rest still masked
+Model input: [prompt] + ["still" MASK | MASK MASK | MASK]
+                         ↑ "still" is known, rest still masked
 
-π_θ("left" | prompt, "has") = 0.91   ← Exact! "left" genuinely conditioned on "has"
-                                          This matches the rollout conditional structure perfectly
+π_θ("has" | prompt, "still") = 0.91   ← Exact! "has" genuinely conditioned on "still"
+                                           This matches the rollout conditional structure perfectly
 ```
 
-**Step 3: tokens "2" and "apples", prefix = {"has","left"}**
+**Step 3: tokens "2" and "apples", prefix = {"still","has"}**
 
 ```
-Model input: [prompt] + ["has" "left" | MASK MASK | MASK]
-                                        ↑ Block 2 fully masked, but Block 1 is clean
+Model input: [prompt] + ["still" "has" | MASK MASK | MASK]
+                                         ↑ Block 2 fully masked, but Block 1 is clean
 
-π_θ("2"      | prompt, "has","left") = 0.88   ← Exact! Block 1 fully known
-π_θ("apples" | prompt, "has","left") = 0.92   ← Exact!
+π_θ("2"      | prompt, "still","has") = 0.88   ← Exact! Block 1 fully known
+π_θ("apples" | prompt, "still","has") = 0.92   ← Exact!
 ```
 
-> Here Block 1's content is `["has","left"]` — the tokens **actually decoded during rollout**, not randomly masked.  
+> Here Block 1's content is `["still","has"]` — the tokens **actually decoded during rollout**, not randomly masked.  
 > This is precisely where "unbiased" comes from.
 
-**Step 4: token "remaining", prefix = {"has","left","2","apples"}**
+**Step 4: token "left", prefix = {"still","has","2","apples"}**
 
 ```
-Model input: [prompt] + ["has" "left" | "2" "apples" | MASK]
+Model input: [prompt] + ["still" "has" | "2" "apples" | MASK]
 
-π_θ("remaining" | prompt, B1, B2) = 0.95   ← Exact!
+π_θ("left" | prompt, B1, B2) = 0.95   ← Exact!
 ```
 
 **Attention implementation:** FlexAttention + regular blockwise mask → **~6× faster than TraceRL**
